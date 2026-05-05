@@ -2,5 +2,8 @@
   "dependencies": {},
   "devDependencies": {
     "@types/bun": "^1.3.13"
+  },
+  "scripts": {
+    "bench": "bun bench/benchmark.ts"
   }
 }

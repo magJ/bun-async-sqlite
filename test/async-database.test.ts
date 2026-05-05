@@ -47,3 +47,19 @@ describe("AsyncDatabase", () => {
     await db.close();
   });
 });
+
+import { AsyncDatabasePool } from "../src/async-database-pool";
+
+test("pool round-robin execution", async () => {
+  const pool = new AsyncDatabasePool(2, "/tmp/async-pool-test.db");
+  const setup = new AsyncDatabase("/tmp/async-pool-test.db");
+  await setup.exec("DROP TABLE IF EXISTS pool_test");
+  await setup.close();
+  await pool.exec("CREATE TABLE pool_test (id INTEGER PRIMARY KEY, value TEXT)");
+  await pool.run("INSERT INTO pool_test (value) VALUES (?)", "a");
+  const stmt = await pool.query<{ c: number }>("SELECT COUNT(*) as c FROM pool_test");
+  const row = await stmt.get();
+  expect(row?.c).toBe(1);
+  await stmt.finalize();
+  await pool.close();
+});
