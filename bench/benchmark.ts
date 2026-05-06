@@ -149,6 +149,110 @@ async function benchAsyncParallelPool(workers: number) {
   return elapsed;
 }
 
+// ─── Expensive-query benchmarks ────────────────────────────────────────────
+//
+// Cross-join forces O(N²) row-pair evaluations per query (SQLite nested-loop,
+// returns a single scalar so result-transfer overhead is negligible).
+// With N=700 each query takes ~20–30 ms, making IPC overhead irrelevant and
+// exposing how well async workers parallelise truly compute-bound SQLite work.
+//
+// Tune HEAVY_N up/down if the single-query time is outside the 10–50 ms range
+// on your hardware.
+
+const HEAVY_N = 700;
+const HEAVY_OPS = 40;
+const HEAVY_SQL =
+  "SELECT SUM(a.id * b.id % 1000007) FROM bench a CROSS JOIN bench b WHERE a.id <= ? AND b.id <= ?";
+
+async function benchHeavySyncSeq() {
+  const db = new Database(DB_FILE, { readonly: true });
+  const stmt = db.query<{ n: number }, [number, number]>(HEAVY_SQL);
+  const start = nowMs();
+  for (let i = 0; i < HEAVY_OPS; i++) stmt.get(HEAVY_N, HEAVY_N);
+  const elapsed = nowMs() - start;
+  stmt.finalize();
+  db.close();
+  return elapsed;
+}
+
+async function benchHeavyAsyncSeq() {
+  const db = new AsyncDatabase(DB_FILE, { readonly: true });
+  const stmt = await db.query<{ n: number }, [number, number]>(HEAVY_SQL);
+  const start = nowMs();
+  for (let i = 0; i < HEAVY_OPS; i++) await stmt.get(HEAVY_N, HEAVY_N);
+  const elapsed = nowMs() - start;
+  await stmt.finalize();
+  await db.close();
+  return elapsed;
+}
+
+async function benchHeavyAsyncParallel(workers: number) {
+  const pool = new AsyncDatabasePool(workers, DB_FILE, { readonly: true });
+  const stmts = await pool.mapWorkers((db) =>
+    db.query<{ n: number }, [number, number]>(HEAVY_SQL)
+  );
+  const start = nowMs();
+  // Fire all HEAVY_OPS queries simultaneously; the pool distributes them across workers.
+  await runParallelWith(HEAVY_OPS, HEAVY_OPS, (i) => stmts[i % workers].get(HEAVY_N, HEAVY_N));
+  const elapsed = nowMs() - start;
+  await Promise.all(stmts.map((s) => s.finalize()));
+  await pool.close();
+  return elapsed;
+}
+
+// ─── Main-thread overlap benchmark ─────────────────────────────────────────
+//
+// Demonstrates a unique advantage of the async API: the main thread stays
+// free during query execution and can do useful CPU work in parallel.
+//
+//   sync  path: run query (blocks) → CPU burn        wall ≈ query_ms + burn_ms
+//   async path: fire query (non-blocking) → CPU burn → await result
+//               the worker runs in a separate OS thread, so both proceed
+//               simultaneously.                       wall ≈ max(query_ms, burn_ms)
+//
+// We burn for ~75 % of the average query time.  The theoretical speedup is
+// 1 + 0.75 = 1.75×; in practice it is close to that.
+
+const OVERLAP_TRIALS = 15;
+
+function cpuBurn(ms: number): number {
+  const deadline = performance.now() + ms;
+  let x = 0;
+  while (performance.now() < deadline) x = (x + 1) & 0xffff;
+  return x; // prevent dead-code elimination
+}
+
+async function benchOverlapSync(burnMs: number) {
+  const db = new Database(DB_FILE, { readonly: true });
+  const stmt = db.query<any, [number, number]>(HEAVY_SQL);
+  stmt.get(HEAVY_N, HEAVY_N); // warm-up
+  const start = nowMs();
+  for (let i = 0; i < OVERLAP_TRIALS; i++) {
+    stmt.get(HEAVY_N, HEAVY_N); // blocks the main thread
+    cpuBurn(burnMs);             // CPU work must wait until query finishes
+  }
+  const elapsed = nowMs() - start;
+  stmt.finalize();
+  db.close();
+  return elapsed;
+}
+
+async function benchOverlapAsync(burnMs: number) {
+  const db = new AsyncDatabase(DB_FILE, { readonly: true });
+  const stmt = await db.query<any, [number, number]>(HEAVY_SQL);
+  await stmt.get(HEAVY_N, HEAVY_N); // warm-up
+  const start = nowMs();
+  for (let i = 0; i < OVERLAP_TRIALS; i++) {
+    const pending = stmt.get(HEAVY_N, HEAVY_N); // dispatched to worker, returns immediately
+    cpuBurn(burnMs);                             // runs while the worker executes the query
+    await pending;
+  }
+  const elapsed = nowMs() - start;
+  await stmt.finalize();
+  await db.close();
+  return elapsed;
+}
+
 async function main() {
   setupDb();
   const cores = navigator.hardwareConcurrency || 1;
@@ -178,6 +282,42 @@ async function main() {
     { mode: "async worker x2", ms: asyncPar2.toFixed(2), throughput: rate(PARALLEL_OPS, asyncPar2) },
     { mode: "async worker x4", ms: asyncPar4.toFixed(2), throughput: rate(PARALLEL_OPS, asyncPar4) },
   ]);
+
+  // ── Expensive queries ──────────────────────────────────────────────────────
+  console.log(`\nExpensive queries — cross-join N=${HEAVY_N}, ops=${HEAVY_OPS} (all fired simultaneously in parallel modes)`);
+
+  const heavySyncSeq    = await benchHeavySyncSeq();
+  const heavyAsyncSeq   = await benchHeavyAsyncSeq();
+  const heavyAsyncPar1  = await benchHeavyAsyncParallel(1);
+  const heavyAsyncPar2  = await benchHeavyAsyncParallel(2);
+  const heavyAsyncPar4  = await benchHeavyAsyncParallel(4);
+
+  const avgQueryMs = heavySyncSeq / HEAVY_OPS;
+  console.log(`Average single-query time (sync baseline): ${avgQueryMs.toFixed(1)} ms`);
+  console.table([
+    { mode: "sync sequential",              ms: heavySyncSeq.toFixed(1),   throughput: rate(HEAVY_OPS, heavySyncSeq) },
+    { mode: "async x1 sequential",          ms: heavyAsyncSeq.toFixed(1),  throughput: rate(HEAVY_OPS, heavyAsyncSeq) },
+    { mode: "async x1 parallel (all at once)", ms: heavyAsyncPar1.toFixed(1), throughput: rate(HEAVY_OPS, heavyAsyncPar1) },
+    { mode: "async x2 parallel (all at once)", ms: heavyAsyncPar2.toFixed(1), throughput: rate(HEAVY_OPS, heavyAsyncPar2) },
+    { mode: "async x4 parallel (all at once)", ms: heavyAsyncPar4.toFixed(1), throughput: rate(HEAVY_OPS, heavyAsyncPar4) },
+  ]);
+
+  // ── Main-thread overlap ────────────────────────────────────────────────────
+  const burnMs = Math.max(5, Math.round(avgQueryMs * 0.75));
+  console.log(`\nMain-thread overlap — ${OVERLAP_TRIALS} trials`);
+  console.log(`Async fires the query (non-blocking) then immediately runs ${burnMs} ms of CPU work.`);
+  console.log(`The worker executes the query in a separate OS thread, so both proceed in parallel.`);
+  console.log(`Sync must wait for the query before any CPU work can start.`);
+
+  const overlapSync  = await benchOverlapSync(burnMs);
+  const overlapAsync = await benchOverlapAsync(burnMs);
+  const speedup = overlapSync / overlapAsync;
+
+  console.table([
+    { mode: "sync  (query → CPU work, serial)",   ms: overlapSync.toFixed(1),  throughput: rate(OVERLAP_TRIALS, overlapSync) },
+    { mode: "async (query ∥ CPU work, parallel)", ms: overlapAsync.toFixed(1), throughput: rate(OVERLAP_TRIALS, overlapAsync) },
+  ]);
+  console.log(`Overlap speedup: ${speedup.toFixed(2)}×  (theoretical ceiling for ${burnMs} ms burn / ${avgQueryMs.toFixed(1)} ms query: ${(1 + burnMs / avgQueryMs).toFixed(2)}×)`);
 }
 
 await main();
